@@ -1,103 +1,248 @@
 #!/usr/bin/env bash
 # bin/compile <build-dir> <cache-dir> <env-dir>
-# $HOME: /app
 
-# -e - always exit on error
-# -o pipefail - don't ignore exit codes when piping output
-set -eo pipefail
+### Configure environment
 
-BUILD_DIR=${1:-.}
+set -o errexit    # always exit on error
+set -o pipefail   # don't ignore exit codes when piping output
+
+if [ -n "$BUILDPACK_DEBUG" ]; then
+    set -x
+fi
+
+unset GIT_DIR     # Avoid GIT_DIR leak from previous build steps
+
+[ "$BUILDPACK_XTRACE" ] && set -o xtrace
+
+### Configure directories
+
+BUILD_DIR=${1:-}
 CACHE_DIR=${2:-}
 ENV_DIR=${3:-}
 BP_DIR=$(cd "$(dirname "${0:-}")"; cd ..; pwd)
 
 ### Load dependencies
+
+# shellcheck source=lib/output.sh
+source "$BP_DIR/lib/output.sh"
+# shellcheck source=lib/environment.sh
+source "$BP_DIR/lib/environment.sh"
+# shellcheck source=lib/json.sh
 source "$BP_DIR/lib/json.sh"
 
-HEROKU_DIR=$BUILD_DIR/.heroku
-BIN_DIR=$HEROKU_DIR/bin
+LOG_FILE=$(mktemp -t bun-build-log.XXXXX)
+echo "" > "$LOG_FILE"
 
-# To enable the local source build cache path, copy the files and match the build path with the startup path.
-cp -rp $BUILD_DIR $HOME
-cd $HOME
+### Handle errors
 
-# Export the content of the ENV_DIR into the environment
-if [ -d "$ENV_DIR" ]; then
-  for e in $(ls $ENV_DIR); do
-    export "$e=$(cat $ENV_DIR/$e)"
-  done
-fi
+handle_failure() {
+  header "Build failed"
+  echo "Check the build log for more details"
+  cat "$LOG_FILE"
+}
+trap 'handle_failure' ERR
+
+### Check initial state
+
+[ -e "$BUILD_DIR/node_modules" ] && PREBUILD=true || PREBUILD=false
+[ -f "$BUILD_DIR/bun.lockb" ] && BUN_LOCK=true || BUN_LOCK=false
+
+### Compile
+
+create_env() {
+  export_env_dir "$ENV_DIR"
+  write_profile "$BP_DIR" "$BUILD_DIR"
+  write_export "$BP_DIR" "$BUILD_DIR"
+}
+
+header "Creating runtime environment" | output "$LOG_FILE"
+
+mkdir -p "$BUILD_DIR/.scalingo/node/"
+cd "$BUILD_DIR"
+create_env
+
+### Determine Bun version
+
+BUN_VERSION=""
 
 # Allow Bun version pinning via a choice of 3 different files
-if [ -f $BUILD_DIR/.bun-version ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/.bun-version)"
-elif [ -f $BUILD_DIR/runtime.bun.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.bun.txt)"
-elif [ -f $BUILD_DIR/runtime.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.txt)"
+if [ -f "$BUILD_DIR/.bun-version" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/.bun-version")"
+elif [ -f "$BUILD_DIR/runtime.bun.txt" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/runtime.bun.txt")"
+elif [ -f "$BUILD_DIR/runtime.txt" ]; then
+  BUN_VERSION="$(cat "$BUILD_DIR/runtime.txt")"
 fi
-echo "Installing Bun $BUN_VERSION"
 
-if [[ -n $BUN_VERSION ]]
-then
+if [[ -n $BUN_VERSION ]]; then
   # prepend a v to version numbers, eg 1.0.19 -> v1.0.19
   if [[ $BUN_VERSION =~ ^[0-9] ]]; then
     BUN_VERSION="v${BUN_VERSION}"
   fi
+  echo "Bun version (from config file): $BUN_VERSION"
   BUN_INSTALL_VERSION="-s bun-$BUN_VERSION"
+else
+  echo "Bun version: latest"
+  BUN_INSTALL_VERSION=""
 fi
 
-# install bun
-export BUN_INSTALL=$BUILD_DIR/.heroku
-export BUN_DIR=$BUILD_DIR/.heroku/cache
-curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash $BUN_INSTALL_VERSION
+### Install Bun
+
+header "Installing Bun" | output "$LOG_FILE"
+
+export BUN_INSTALL="$BUILD_DIR/.scalingo"
+export BUN_DIR="$BUILD_DIR/.scalingo/cache"
+
+echo "Downloading and installing Bun..." | output "$LOG_FILE"
+curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash $BUN_INSTALL_VERSION | output "$LOG_FILE"
+
 export PATH="$BUN_INSTALL/bin:$PATH"
 
-# set environment variables at runtime
+echo "Installed Bun v$(bun --version)" | output "$LOG_FILE"
+
+### Set environment variables at runtime
+
 PROFILE_PATH="$BUILD_DIR/.profile.d/bun.sh"
-mkdir -p $(dirname $PROFILE_PATH)
-echo 'export PATH="$HOME/.heroku/bin:$PATH"' >> $PROFILE_PATH
-echo 'export BUN_DIR="$HOME/.heroku/cache"' >> $PROFILE_PATH
+mkdir -p "$(dirname "$PROFILE_PATH")"
+echo 'export PATH="$HOME/.scalingo/bin:$PATH"' >> "$PROFILE_PATH"
+echo 'export BUN_DIR="$HOME/.scalingo/cache"' >> "$PROFILE_PATH"
 
-# export environment variables to subsequent buildpacks
-echo "export PATH=\"$BUILD_DIR/.heroku/bin:\$PATH\"" >> "$BP_DIR/export"
-echo "export BUN_DIR=\"$BUILD_DIR/.heroku/cache\"" >> "$BP_DIR/export"
+### Export environment variables to subsequent buildpacks
 
-echo "Installed Bun v$(bun --version)"
+mkdir -p "$BP_DIR/export"
+echo "export PATH=\"$BUILD_DIR/.scalingo/bin:\$PATH\"" >> "$BP_DIR/export"
+echo "export BUN_DIR=\"$BUILD_DIR/.scalingo/cache\"" >> "$BP_DIR/export"
 
-set +e
+### Restore cache
 
-cd $BUILD_DIR
+restore_cache() {
+  if [[ -d "$CACHE_DIR/node_modules" ]] && [[ "$NODE_MODULES_CACHE" != "false" ]]; then
+    header "Restoring cache"
+    echo "Restoring node_modules from cache" | output "$LOG_FILE"
+    cp -r "$CACHE_DIR/node_modules" "$BUILD_DIR/"
+  else
+    header "Restoring cache"
+    echo "No cache found or caching disabled" | output "$LOG_FILE"
+  fi
+}
 
-# download dependencies
-if [[ -f package.json && ! -f .skip-bun-install ]]
-then
-  echo "Installing dependencies..."
-  bun install
+restore_cache
+
+### Install dependencies
+
+header "Installing dependencies" | output "$LOG_FILE"
+
+if [[ -f "$BUILD_DIR/package.json" && ! -f "$BUILD_DIR/.skip-bun-install" ]]; then
+  echo "Running bun install..." | output "$LOG_FILE"
+
+  if $PREBUILD && [[ "$NODE_MODULES_CACHE" != "false" ]]; then
+    echo "node_modules already exists, running install to update..." | output "$LOG_FILE"
+  fi
+
+  if ! bun install 2>&1 | output "$LOG_FILE"; then
+    echo "bun install failed" | output "$LOG_FILE"
+    exit 1
+  fi
+
+  echo "Dependencies installed successfully" | output "$LOG_FILE"
+else
+  if [[ ! -f "$BUILD_DIR/package.json" ]]; then
+    echo "No package.json found, skipping dependency installation" | output "$LOG_FILE"
+  else
+    echo "Skipping bun install (.skip-bun-install file found)" | output "$LOG_FILE"
+  fi
 fi
 
-has_heroku_prebuild_script=$(has_script "package.json" "heroku-prebuild")
-if [[ "$has_heroku_prebuild_script" == "true" && ! -f .skip-bun-heroku-prebuild ]]
-then
-  echo "Running Heroku prebuild script..."
-  bun run heroku-prebuild
+### Run prebuild script
+
+has_scalingo_prebuild_script=$(has_script "$BUILD_DIR/package.json" "prebuild-script")
+if [[ "$has_scalingo_prebuild_script" == "true" && ! -f "$BUILD_DIR/.skip-bun-scalingo-prebuild" ]]; then
+  header "Running Scalingo prebuild script" | output "$LOG_FILE"
+  if ! bun run prebuild-script 2>&1 | output "$LOG_FILE"; then
+    echo "prebuild-script failed" | output "$LOG_FILE"
+    exit 1
+  fi
 fi
 
-has_build_script=$(has_script "package.json" "build")
-if [[ "$has_build_script" == "true" && ! -f .skip-bun-build ]]
-then
-  echo "Building application..."
-  bun run build
-  echo "Done building application..."
+### Run build script
+
+has_build_script=$(has_script "$BUILD_DIR/package.json" "build")
+if [[ "$has_build_script" == "true" && ! -f "$BUILD_DIR/.skip-bun-build" ]]; then
+  header "Building application" | output "$LOG_FILE"
+  if ! bun run build 2>&1 | output "$LOG_FILE"; then
+    echo "build script failed" | output "$LOG_FILE"
+    exit 1
+  fi
+  echo "Application built successfully" | output "$LOG_FILE"
 fi
 
-has_heroku_postbuild_script=$(has_script "package.json" "heroku-postbuild")
-if [[ "$has_heroku_postbuild_script" == "true" && ! -f .skip-bun-heroku-postbuild ]]
-then
-  echo "Running Heroku postbuild script..."
-  bun run heroku-postbuild
+### Run postbuild script
+
+has_scalingo_postbuild_script=$(has_script "$BUILD_DIR/package.json" "postbuild-script")
+if [[ "$has_scalingo_postbuild_script" == "true" && ! -f "$BUILD_DIR/.skip-bun-scalingo-postbuild" ]]; then
+  header "Running Scalingo postbuild script" | output "$LOG_FILE"
+  if ! bun run postbuild-script 2>&1 | output "$LOG_FILE"; then
+    echo "postbuild-script failed" | output "$LOG_FILE"
+    exit 1
+  fi
 fi
 
+### Cache build
+
+cache_build() {
+  if [[ "${NODE_MODULES_CACHE:-true}" != "false" ]] && [[ -d "$BUILD_DIR/node_modules" ]]; then
+    header "Caching build"
+    echo "Saving node_modules to cache" | output "$LOG_FILE"
+    mkdir -p "$CACHE_DIR"
+    rm -rf "$CACHE_DIR/node_modules"
+    cp -r "$BUILD_DIR/node_modules" "$CACHE_DIR/"
+  else
+    header "Caching build"
+    echo "Caching disabled or no node_modules to cache" | output "$LOG_FILE"
+  fi
+}
+
+cache_build
+
+### Prune devDependencies
+
+prune_devdependencies() {
+  if [[ "${NPM_CONFIG_PRODUCTION:-false}" == "true" ]] || [[ "${NODE_ENV:-}" == "production" ]]; then
+    header "Pruning devDependencies"
+    echo "Running bun install --production to remove devDependencies..." | output "$LOG_FILE"
+    if ! bun install --production 2>&1 | output "$LOG_FILE"; then
+      echo "Warning: Failed to prune devDependencies" | output "$LOG_FILE"
+    else
+      echo "devDependencies pruned successfully" | output "$LOG_FILE"
+    fi
+  fi
+}
+
+prune_devdependencies
+
+### Run cleanup script
+
+has_cleanup_script=$(has_script "$BUILD_DIR/package.json" "scalingo-cleanup")
+if [[ "$has_cleanup_script" == "true" ]]; then
+  header "Running Scalingo cleanup script" | output "$LOG_FILE"
+  if ! bun run scalingo-cleanup 2>&1 | output "$LOG_FILE"; then
+    echo "Warning: scalingo-cleanup script failed" | output "$LOG_FILE"
+  fi
+fi
+
+### Finalize
+
+header "Build succeeded!" | output "$LOG_FILE"
+echo "Bun v$(bun --version) installed" | output "$LOG_FILE"
+
+if [[ -f "$BUILD_DIR/package.json" ]]; then
+  echo "Dependencies installed and application built successfully" | output "$LOG_FILE"
+fi
+
+# Warn if no start script
+if [[ ! $(has_script "$BUILD_DIR/package.json" "start") == "true" ]]; then
+  echo "" | output "$LOG_FILE"
+  echo "WARNING: No start script found in package.json" | output "$LOG_FILE"
+  echo "You will need to define a start command in your Procfile" | output "$LOG_FILE"
+  echo "See: https://doc.scalingo.com/platform/app/procfile" | output "$LOG_FILE"
+fi
