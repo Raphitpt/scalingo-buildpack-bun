@@ -107,12 +107,6 @@ mkdir -p "$(dirname "$PROFILE_PATH")"
 echo 'export PATH="$HOME/.scalingo/bin:$PATH"' >> "$PROFILE_PATH"
 echo 'export BUN_DIR="$HOME/.scalingo/cache"' >> "$PROFILE_PATH"
 
-### Export environment variables to subsequent buildpacks
-
-mkdir -p "$BP_DIR/export"
-echo "export PATH=\"$BUILD_DIR/.scalingo/bin:\$PATH\"" >> "$BP_DIR/export"
-echo "export BUN_DIR=\"$BUILD_DIR/.scalingo/cache\"" >> "$BP_DIR/export"
-
 ### Restore cache
 
 restore_cache() {
