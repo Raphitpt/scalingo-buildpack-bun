@@ -45,7 +45,7 @@ trap 'handle_failure' ERR
 ### Check initial state
 
 [ -e "$BUILD_DIR/node_modules" ] && PREBUILD=true || PREBUILD=false
-[ -f "$BUILD_DIR/bun.lockb" ] && BUN_LOCK=true || BUN_LOCK=false
+[ -f "$BUILD_DIR/bun.lock" ] && BUN_LOCK=true || BUN_LOCK=false
 
 ### Compile
 
